@@ -40,7 +40,7 @@ Push only to `origin`. Never push to `upstream`.
 ## 5. Production paths (exact)
 | Thing | Path |
 |---|---|
-| Source repo | `/home/felix-eyal/flow-dev/zou` |
+| Source repo | `/home/felix-eyal/flow-dev/Kitsu-Mods/zou` |
 | Deployed runtime (venv) | `/opt/zou/zouenv` (Python 3.13; `pip show zou` → 1.0.28) |
 | Installed package | `/opt/zou/zouenv/lib/python3.13/site-packages/zou` |
 | Plugins (live) | `/flow-srv/zou/plugins/` |
