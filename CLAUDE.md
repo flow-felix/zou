@@ -42,6 +42,20 @@ Push only to `origin`. Never push to `upstream`.
 | `flow-client-portal` | client review portal | low | dev source has no git origin set |
 | `tickets` | kitsu-tickets | low | dev origin: `cgwire/kitsu-tickets` |
 | `whiteboard` | kitsu-whiteboard | low | dev origin: `INGIPSA/...` |
+| `flow_schedule_hotfix` | Monkeypatch guard for empty-source schedule-version task-link copy (works around a Zou 1.0.52 core bug) | low (routes-less; delegates populated copies to upstream unchanged) | dev source: `Kitsu-Plugins/flow_schedule_hotfix`. **Temporary** — remove when upstream Zou fixes the bug. Added 2026-07-01. |
+
+> **Known upstream issue (Zou 1.0.52):** in `schedule_service.py`, seeding a new
+> production-schedule-version's task-links *from a source that has no tasks/links*
+> builds `rows == []` and `insert(Model).values([])` renders a degenerate INSERT
+> that omits the NOT NULL FK columns → `NotNullViolation` → HTTP 500. Symptom in
+> Kitsu Forecast: a new calendar comes up empty / "changes don't save". Guarded by
+> `flow_schedule_hotfix`. Copying from a *populated* source was never affected.
+>
+> **Known plugin issue (`flowly`):** `render_artifacts._write` does `os.replace(tmp, mp)`
+> where the tmp file is sometimes already gone → recurring `FileNotFoundError` in
+> `gunicorn_error.log` during render-artifact ingestion (seen ~39× post-restart on
+> 2026-07-01). Pre-existing, unrelated to the version bump; fix belongs in the flowly
+> plugin (make the write atomic / tolerate a missing tmp).
 
 ## 5. Production paths (exact)
 | Thing | Path |
@@ -53,6 +67,7 @@ Push only to `origin`. Never push to `upstream`.
 | Plugin dev sources | `/flow-srv/dev/kitsu-plugins/` |
 | Env / config | `/etc/zou/zou.env`, `/etc/zou/gunicorn.py`, `/etc/zou/gunicorn-events.py` |
 | Logs | `/opt/zou/logs/gunicorn_{access,error}.log` |
+| Backups (pip-freeze + DB dumps) | `/flow-srv/zou/backups/` (root-owned; `/flow-srv` has ~700G free — DB is only ~140MB) |
 | Data / previews / tmp | `/flow-srv/kitsu/{data,previews,tmp}` (symlinked under `/opt/zou`) |
 | DB | PostgreSQL `zoudb` on `localhost:5432` (user `postgres`) |
 
