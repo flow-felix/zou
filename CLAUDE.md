@@ -15,11 +15,17 @@ upstream  https://github.com/cgwire/zou.git           # CGWire (read-only)
 ```
 Push only to `origin`. Never push to `upstream`.
 
-## 3. ⚠️ Current divergence (must reconcile — see migration plan)
-- **Source repo is at `1.0.24`** (`zou/__init__.py`), `main` mirrors upstream.
-- **Production runs stock pip `zou==1.0.28`** in the venv (`/opt/zou/zouenv`) — *not* built from this repo, and **no in-place edits** to site-packages were found (all files share the install timestamp).
-- Therefore: today, Flow's only live backend customization is the **plugins** + service/nginx config, none of which is committed here.
-- Reconciliation: bump this fork's `main`/`flow/main` to the `v1.0.28` upstream tag so the repo matches production, then manage plugins + any core patches from git.
+## 3. Version state (reconciled 2026-07-01)
+- **Source repo `main`/`flow/main` and production pip both at `1.0.52`.** `main`
+  mirrors upstream; `flow/main` = upstream + Flow (currently no core patches, only
+  this CLAUDE.md). Runtime is a clean pip `zou==1.0.52` in `/opt/zou/zouenv`.
+- Flow's only live backend customizations remain the **plugins** (§4) + service/nginx
+  config; core Zou is unmodified, so upstream bumps stay trivial.
+- **History:** the repo previously lagged production (repo `1.0.24` vs prod pip
+  `1.0.28`). On 2026-07-01 both `main`/`flow/main` were fast-forwarded to upstream
+  `1.0.52` and production was upgraded to match (`pip install zou==1.0.52` +
+  `zou upgrade-db`). See `CHANGELOG.md`. Keep this in lockstep on future bumps —
+  sync git first (§12), then pin prod to the same version.
 
 ## 4. Flow customizations — isolation rules (plugins first)
 **Strongly prefer plugins over editing core Zou** (keeps upstream upgrades trivial — prod is a clean pip install).
@@ -41,7 +47,7 @@ Push only to `origin`. Never push to `upstream`.
 | Thing | Path |
 |---|---|
 | Source repo | `/home/felix-eyal/flow-dev/Kitsu-Mods/zou` |
-| Deployed runtime (venv) | `/opt/zou/zouenv` (Python 3.13; `pip show zou` → 1.0.28) |
+| Deployed runtime (venv) | `/opt/zou/zouenv` (Python 3.13; `pip show zou` → 1.0.52) |
 | Installed package | `/opt/zou/zouenv/lib/python3.13/site-packages/zou` |
 | Plugins (live) | `/flow-srv/zou/plugins/` |
 | Plugin dev sources | `/flow-srv/dev/kitsu-plugins/` |
