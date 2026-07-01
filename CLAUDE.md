@@ -1,381 +1,114 @@
-# Zou - Project Guidelines
+# CLAUDE.md — Flow fork of **Zou** (API backend)
 
-Zou is the REST API backend for **Kitsu**, a production management tool for animation/VFX studios. Built on Flask + PostgreSQL.
+> Persistent workflow + deployment rules for this repo. Read before editing,
+> building, or deploying. Sister doc: the Flow fork of **Kitsu** (`flow-dev/kitsu/CLAUDE.md`).
 
-## Quick Reference
+## 1. Repo purpose
+Flow Animation's fork of CGWire **Zou** (Flask API + RQ jobs + event stream; the
+backend behind Kitsu). Flow's backend customizations are delivered primarily as
+**Zou plugins**, not by patching core Zou — see §4.
 
+## 2. Remotes (already configured — verify, don't recreate)
+```
+origin    https://github.com/flow-felix/zou.git       # Flow fork
+upstream  https://github.com/cgwire/zou.git           # CGWire (read-only)
+```
+Push only to `origin`. Never push to `upstream`.
+
+## 3. ⚠️ Current divergence (must reconcile — see migration plan)
+- **Source repo is at `1.0.24`** (`zou/__init__.py`), `main` mirrors upstream.
+- **Production runs stock pip `zou==1.0.28`** in the venv (`/opt/zou/zouenv`) — *not* built from this repo, and **no in-place edits** to site-packages were found (all files share the install timestamp).
+- Therefore: today, Flow's only live backend customization is the **plugins** + service/nginx config, none of which is committed here.
+- Reconciliation: bump this fork's `main`/`flow/main` to the `v1.0.28` upstream tag so the repo matches production, then manage plugins + any core patches from git.
+
+## 4. Flow customizations — isolation rules (plugins first)
+**Strongly prefer plugins over editing core Zou** (keeps upstream upgrades trivial — prod is a clean pip install).
+1. **Plugin** under `/flow-srv/zou/plugins/<name>` — the default. All current Flow backend features are plugins.
+2. **Environment override** via `/etc/zou/zou.env` (config, no code change).
+3. **Monkeypatch in a plugin's init** — only for behavior you cannot reach via the plugin API; isolate it in one clearly-commented module so it's auditable on upgrade.
+4. **Core edit in this fork** — last resort. If unavoidable, make it a discrete `flow/<feature>` branch, mark with `# FLOW:` comments, and re-apply on each upstream bump.
+
+### Plugins inventory (deployed at `/flow-srv/zou/plugins/`, currently NOT git repos)
+| Plugin | Purpose | Upstream-conflict risk | Notes |
+|---|---|---|---|
+| `flowly` | Flow render/SVN/worker bridge | low (self-contained) | dev source: `flow-felix/flowly-plugin` |
+| `production_assistant` | Claude agent (shells `claude -p` in worker, `exec()`s LLM code) | low-conflict but **operational risk** | runs blocking subprocess in a gevent worker; can stall API. No tracked origin. |
+| `flow-client-portal` | client review portal | low | dev source has no git origin set |
+| `tickets` | kitsu-tickets | low | dev origin: `cgwire/kitsu-tickets` |
+| `whiteboard` | kitsu-whiteboard | low | dev origin: `INGIPSA/...` |
+
+## 5. Production paths (exact)
+| Thing | Path |
+|---|---|
+| Source repo | `/home/felix-eyal/flow-dev/Kitsu-Mods/zou` |
+| Deployed runtime (venv) | `/opt/zou/zouenv` (Python 3.13; `pip show zou` → 1.0.28) |
+| Installed package | `/opt/zou/zouenv/lib/python3.13/site-packages/zou` |
+| Plugins (live) | `/flow-srv/zou/plugins/` |
+| Plugin dev sources | `/flow-srv/dev/kitsu-plugins/` |
+| Env / config | `/etc/zou/zou.env`, `/etc/zou/gunicorn.py`, `/etc/zou/gunicorn-events.py` |
+| Logs | `/opt/zou/logs/gunicorn_{access,error}.log` |
+| Data / previews / tmp | `/flow-srv/kitsu/{data,previews,tmp}` (symlinked under `/opt/zou`) |
+| DB | PostgreSQL `zoudb` on `localhost:5432` (user `postgres`) |
+
+## 6. systemd services
+| Unit | Role | Bind |
+|---|---|---|
+| `zou.service` | gunicorn API (gevent, 4 workers) | `127.0.0.1:5000` |
+| `zou-events.service` | gunicorn event stream | `127.0.0.1:5001` |
+| `zou-jobs.service` | RQ worker (async jobs) | — |
+All use `EnvironmentFile=/etc/zou/zou.env` and run `/opt/zou/zouenv/bin/gunicorn`.
+nginx (`/etc/nginx/sites-enabled/zou`) proxies `/api` → `:5000`, events → `:5001`.
+
+## 7. Build / install steps (runtime = pip in venv, not a source build)
 ```bash
-# Lint / format
-pre-commit run --all-files
-
-# Generate a migration
-zou migrate-db --message "Add column X to table Y"
+# Upgrade or pin Zou itself (production target version):
+sudo -u zou /opt/zou/zouenv/bin/pip install "zou==<version>"
+# Install a Flow plugin from its git source (do NOT hand-copy):
+sudo -u zou /opt/zou/zouenv/bin/zou install-plugin /flow-srv/dev/kitsu-plugins/<plugin>
+# DB migrations after a version bump:
+sudo -u zou bash -c 'set -a; . /etc/zou/zou.env; /opt/zou/zouenv/bin/zou upgrade-db'
 ```
 
-## Architecture
-
-```
-zou/
-├── app/
-│   ├── __init__.py          # Flask app factory, JWT/auth setup
-│   ├── api.py               # Blueprint registration, plugin loading
-│   ├── config.py            # All config from env vars
-│   ├── blueprints/          # ~25 feature-based API blueprint packages
-│   │   ├── auth/            # Login, logout, 2FA, SSO
-│   │   ├── crud/            # Generic CRUD for 40+ models
-│   │   │   ├── base.py      # BaseModelsResource / BaseModelResource
-│   │   │   └── *.py         # Per-model CRUD overrides
-│   │   └── <feature>/       # assets, shots, tasks, projects, etc.
-│   │       ├── __init__.py  # routes list + blueprint
-│   │       ├── resources.py # Resource classes (HTTP handlers)
-│   │       └── schemas.py   # Pydantic request validation
-│   ├── models/              # ~50 SQLAlchemy models (BaseMixin)
-│   ├── services/            # ~40 stateless business logic modules
-│   ├── stores/              # File storage, Redis, event publisher
-│   └── utils/               # Cache, events, permissions, validation, etc.
-├── migrations/              # Alembic migration versions
-├── remote/                  # Remote job runners (playlist, normalize)
-└── cli.py                   # CLI commands (zou init-db, create-admin, etc.)
-tests/
-├── base.py                  # ApiDBTestCase with fixture generators
-├── conftest.py              # Schema create/drop per session
-├── models/                  # CRUD model tests
-├── services/                # Service function tests
-├── utils/                   # Utility tests
-└── <feature>/               # Route-level tests per blueprint
-specs/                       # Detailed architecture specs (for reference)
-```
-
-### Request lifecycle
-
-```
-HTTP → Flask routing → Resource method → @jwt_required()
-  → check_*_permissions() → Service function → Model query/mutation
-  → Event emission → JSON serialization → HTTP Response
-```
-
-## Code Conventions
-
-### Formatting
-- **Black** with line length 79 (`pyproject.toml`)
-- **Autoflake** removes unused imports/variables
-- Pre-commit hooks enforce both — run `pre-commit install` after cloning
-
-### Python style
-- Python 3.10+ (no walrus operator abuse, keep it readable)
-- Services are **module-level functions**, not classes
-- Models inherit `db.Model, BaseMixin, SerializerMixin`
-- UUIDs everywhere for primary keys (`UUIDType(binary=False)`)
-- **String formatting: f-strings only** for any new or edited code. Do not introduce `"... %s" % x` or `.format(...)`. Pre-existing `%`-formatted lines in a file you're editing can stay — don't scope-creep — but every new line you add should use f-strings.
-- **Docstrings: opening and closing `"""` each on their own line.** Always put a newline immediately after the opening `"""` and immediately before the closing `"""`, even for one-liners. Do not write `"""Summary on the same line."""` or `"""First line\n    second line."""`.
-
-  ```python
-  # Wrong
-  """Return the task or None."""
-  """Common flow for bulk download: check permissions,
-  build the bundle, send it as attachment."""
-
-  # Right
-  """
-  Return the task or None.
-  """
-  """
-  Common flow for bulk download: check permissions,
-  build the bundle, send it as attachment.
-  """
-  ```
-
-### Naming
-- Model class: `PascalCase` (e.g., `TaskStatus`)
-- Table: auto `snake_case` (e.g., `task_status`)
-- Route: `kebab-case` (e.g., `/data/task-statuses`)
-- FK column: `<table>_id` (e.g., `project_id`)
-- M2M link table: `<table1>_<table2>_link`
-- Service module: `<domain>_service.py` (e.g., `tasks_service.py`)
-- Service functions: verb-first (`get_task()`, `create_task()`, `update_task()`)
-- Raw vs serialized: `get_task_raw()` returns ORM object, `get_task()` returns dict
-
-### Commit messages
-- Prefix commits with the **domain** in brackets, not the change type
-- The domain is the affected feature area (e.g., `projects`, `tasks`, `assets`, `shots`, `auth`, `playlists`, `previews`)
-- Examples: `[projects] Avoid ObjectDeletedError when removing project tasks`, `[auth] Fix 2FA token expiration`, `[tasks] Allow bulk status update`
-- Use `[tests]`, `[qa]`, `[docs]` only for changes that are purely test/lint/documentation with no domain
-
-### Pull request descriptions
-PR bodies follow a strict two-paragraph format. Do **not** use `## Summary` / `## Test plan` headers — match the existing repo convention exactly:
-
-```markdown
-**Problem**
-- Concise bullet point describing the issue
-- Another bullet if there are multiple related issues
-
-**Solution**
-- Concise bullet point describing what was changed to fix it
-- Another bullet for related changes
-```
-
-Rules:
-- Bullets are short and factual — no narrative paragraphs, no marketing language
-- One PR = one logical change (or a small bundle of tightly related fixes); each problem bullet maps to one or more solution bullets
-- Reference issues with `Fix #1234` or `cgwire/gazu#395` on a final line if applicable
-- No `🤖 Generated with` footer, no `## Test plan` checklist — tests are listed in commit messages, not PR bodies
-
-## Blueprints & Resources
-
-### Adding a new feature endpoint
-
-1. Create `zou/app/blueprints/<name>/`:
-   - `__init__.py` — routes list + blueprint
-   - `resources.py` — Resource classes
-   - `schemas.py` — Pydantic schemas
-
-2. Register in `zou/app/api.py`:
-```python
-from zou.app.blueprints.<name> import blueprint as <name>_blueprint
-app.register_blueprint(<name>_blueprint)
-```
-
-### Resource pattern
-
-```python
-from flask_restful import Resource
-from flask_jwt_extended import jwt_required
-from zou.app.utils import permissions, validation
-from zou.app.blueprints.<name>.schemas import MySchema
-
-class MyResource(Resource):
-    @jwt_required()
-    def post(self):
-        permissions.check_manager_permissions()
-        data = validation.validate_request_body(MySchema)
-        result = my_service.create_something(data.field1, data.field2)
-        return result, 201
-```
-
-### CRUD resources
-
-For standard model CRUD, extend `BaseModelsResource` / `BaseModelResource` in `zou/app/blueprints/crud/`. Override permission hooks:
-- `check_read_permissions()`, `check_create_permissions(data)`
-- `check_update_permissions(instance, data)`, `check_delete_permissions(instance)`
-- `add_project_permission_filter(query)` — scope queries to user's projects
-
-## Pydantic Validation (v2)
-
-All request body validation uses Pydantic v2 schemas. **Do not use `reqparse` or `ArgsMixin` for body parsing** — those are legacy patterns.
-
-### Schema pattern
-
-```python
-# zou/app/blueprints/<name>/schemas.py
-from typing import Optional
-from pydantic import Field
-from zou.app.utils.validation import BaseSchema
-
-class CreateThingSchema(BaseSchema):
-    name: str = Field(..., min_length=1, description="Thing name")
-    project_id: str = Field(..., description="Parent project UUID")
-    description: Optional[str] = None
-```
-
-- `BaseSchema` extends `BaseModel` with `extra="ignore"` (unknown fields are silently dropped)
-- Use `Field(...)` for required fields, `Field(default=...)` or `Optional[X] = None` for optional
-- Call `validation.validate_request_body(SchemaClass)` in your resource — returns validated model or raises `WrongParameterException` (400)
-
-### Query parameters
-
-Query parameters (page, limit, filters) are still read via `ArgsMixin` methods: `get_text_parameter()`, `get_bool_parameter()`, etc. Only request **bodies** use Pydantic.
-
-## Services
-
-Services are stateless modules in `zou/app/services/`. Key patterns:
-
-```python
-# Caching
-from zou.app.utils import cache
-
-@cache.memoize_function(120)  # TTL in seconds
-def get_thing(thing_id):
-    return Thing.get(thing_id).serialize()
-
-# Invalidation after mutation
-def update_thing(thing_id, data):
-    thing = Thing.get(thing_id)
-    thing.update(data)
-    cache.cache.delete_memoized(get_thing, thing_id)
-    events.emit("thing:update", {"thing_id": str(thing.id)})
-    return thing.serialize()
-```
-
-- Raise domain exceptions from `zou/app/services/exception.py` (e.g., `ThingNotFoundException`)
-- Emit events after mutations: `events.emit("entity:action", data, project_id=...)`
-- `get_*_raw()` returns SQLAlchemy instance (for internal use), `get_*()` returns serialized dict
-
-## Models
-
-All models in `zou/app/models/` inherit `db.Model, BaseMixin, SerializerMixin`.
-
-```python
-class MyModel(db.Model, BaseMixin, SerializerMixin):
-    name = db.Column(db.String(80), nullable=False, unique=True)
-    project_id = db.Column(UUIDType(binary=False), db.ForeignKey("project.id"))
-    data = db.Column(JSONB)
-```
-
-`BaseMixin` provides: `create()`, `get(id)`, `get_by()`, `get_all_by()`, `update(data)`, `delete()`, `serialize()`.
-
-The `Entity` model is **polymorphic** — assets, shots, sequences, episodes are all rows distinguished by `entity_type_id`.
-
-## Permissions & Roles
-
-Roles (highest to lowest): **admin > manager > supervisor > user > client > vendor**
-
-```python
-from zou.app.utils import permissions
-
-permissions.check_admin_permissions()                # admin only
-permissions.check_manager_permissions()              # admin or manager
-permissions.check_at_least_supervisor_permissions()  # supervisor+
-user_service.check_project_access(project_id)        # user is team member
-```
-
-## Events
-
-```python
-from zou.app.utils import events
-
-events.emit("task:update", {"task_id": str(task.id)}, project_id=str(task.project_id))
-```
-
-Format: `<table_name>:<action>` — e.g., `task:new`, `comment:delete`, `person:update`. Events are persisted to `ApiEvent` and broadcast via Redis pub/sub to WebSocket clients.
-
-## Testing
-
-See `CLAUDE.local.md` for how to run tests locally. The test DB schema is created/dropped automatically by `conftest.py`.
-
-### Test base class
-
-All tests inherit `ApiDBTestCase` (from `tests/base.py`):
-- Auto-creates admin user and logs in
-- HTTP helpers: `self.get()`, `self.post()`, `self.put()`, `self.delete()`
-- 404 helpers: `self.get_404()`, `self.put_404()`, `self.delete_404()`
-- `self.get_first(path)` — GET list and return first element
-- Fixture generators: `generate_fixture_project()`, `generate_fixture_asset()`, `generate_fixture_task()`, etc.
-- `generate_base_context()` — creates project status, project, asset type, department, task type, task status
-- `generate_data(Model, N, **kwargs)` — creates N random instances with mixer
-
-### CRUD model test pattern
-
-```python
-from tests.base import ApiDBTestCase
-from zou.app.models.department import Department
-
-class DepartmentTestCase(ApiDBTestCase):
-    def setUp(self):
-        super().setUp()
-        self.generate_data(Department, 3)
-
-    def test_get_departments(self):
-        departments = self.get("data/departments")
-        self.assertEqual(len(departments), 3)
-
-    def test_get_department(self):
-        department = self.get_first("data/departments")
-        department_again = self.get("data/departments/%s" % department["id"])
-        self.assertEqual(department, department_again)
-        self.get_404("data/departments/%s" % fields.gen_uuid())
-
-    def test_create_department(self):
-        data = {"name": "open", "color": "#000000"}
-        self.department = self.post("data/departments", data)
-        self.assertIsNotNone(self.department["id"])
-
-    def test_update_department(self):
-        department = self.get_first("data/departments")
-        self.put("data/departments/%s" % department["id"], {"color": "#FFF"})
-
-    def test_delete_department(self):
-        department = self.get_first("data/departments")
-        self.delete("data/departments/%s" % department["id"])
-```
-
-### Service test pattern
-
-```python
-from tests.base import ApiDBTestCase
-from zou.app.services import my_service
-from zou.app.services.exception import MyNotFoundException
-
-class MyServiceTestCase(ApiDBTestCase):
-    def setUp(self):
-        super().setUp()
-        self.generate_fixture_project_status()
-        self.generate_fixture_project()
-
-    def test_get_something(self):
-        result = my_service.get_something(self.project.id)
-        self.assertEqual(len(result), expected)
-
-    def test_not_found(self):
-        self.assertRaises(
-            MyNotFoundException,
-            my_service.get_something,
-            "nonexistent-id",
-        )
-```
-
-## Migrations
+## 8. Deployment workflow
+1. Commit + tag the plugin/source change in its git repo.
+2. Back up: `pip freeze > /opt/zou/backups/pip-freeze-$(date +%F-%H%M).txt`; snapshot the plugin dir.
+3. Install from git (pip pin or `install-plugin`), run migrations if needed.
+4. `sudo systemctl restart zou zou-events zou-jobs`
+5. Verify (§10).
+
+## 9. Rollback workflow
 ```bash
-# Generate
-zou migrate-db --message "Add column X to table Y"
+# Code: reinstall the previous pinned version / previous plugin tag
+sudo -u zou /opt/zou/zouenv/bin/pip install "zou==<previous>"
+sudo -u zou /opt/zou/zouenv/bin/zou install-plugin <plugin-at-previous-tag>
+sudo systemctl restart zou zou-events zou-jobs
+# DB: restore from the pre-deploy dump if a migration must be undone:
+#   pg_restore/psql from /opt/zou/backups/<dump>   (take a dump BEFORE every migration)
+```
+Always `pg_dump zoudb` before any `upgrade-db`.
 
-# Apply
-zou upgrade-db
+## 10. Testing checklist (before deploy)
+- [ ] Plugin/source change committed + tagged in git
+- [ ] `pip freeze` snapshot + DB dump taken
+- [ ] Staging or `zou test`/plugin tests pass
+- [ ] After restart: `systemctl is-active zou zou-events zou-jobs` all active
+- [ ] `curl -s localhost:5000/api` (or health route) OK; tail `gunicorn_error.log` clean
+- [ ] Smoke a time-spent write and a plugin endpoint
 
-# Rollback one step
-zou downgrade-db --revision "-1"
+## 11. Commit standards
+- Upstream style `[area] summary` for core; for plugins use the plugin repo's convention.
+- Core Flow patches isolated on `flow/<feature>` branches, `# FLOW:` markers in code.
 
-Migrations live in `zou/migrations/versions/`. Each file has `upgrade()` and `downgrade()` functions. Use `UUIDType(binary=False)` for UUID columns.
+## 12. Sync upstream safely
+```bash
+git fetch upstream --tags
+git checkout main && git merge --ff-only upstream/main && git push origin main
+git checkout flow/main && git merge main      # re-apply/verify any core patches here
+# bump the pinned prod version only after staging validation
+```
 
-See `CLAUDE.local.md` for `zou migrate-db` / `zou upgrade-db` / `zou downgrade-db` invocations.
-
-## Key Environment Variables
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DB_DATABASE` | zoudb | PostgreSQL database name |
-| `DB_HOST` | localhost | PostgreSQL host |
-| `SECRET_KEY` | mysecretkey | Flask secret (change in prod!) |
-| `KV_HOST` | localhost | Redis host |
-| `CACHE_TYPE` | (None) | Set to `simple` for in-memory cache |
-| `FS_BACKEND` | local | File storage: local, s3, swift |
-| `ENABLE_JOB_QUEUE` | false | Enable RQ/Nomad job queue |
-| `INDEXER_KEY` | (None) | Meilisearch API key |
-| `MAIL_SERVER` | localhost | SMTP server |
-
-## Detailed Specs
-
-For deeper architectural documentation, see `specs/`:
-- `specs/architecture.md` — Full architecture overview
-- `specs/blueprints.md` — Blueprint patterns, CRUD hooks
-- `specs/models.md` — Model hierarchy, entity type system
-- `specs/services.md` — Service patterns, caching, events
-- `specs/testing.md` — Test patterns, fixtures
-- `specs/auth.md` — Authentication, 2FA, roles
-- `specs/configuration.md` — All environment variables
-- `specs/events.md` — Event system
-- `specs/storage.md` — File storage backends
-- `specs/plugins.md` — Plugin system
-
-## Common Tasks Cheatsheet
-
-| Task | How |
-|------|-----|
-| Add a new model | Create in `zou/app/models/`, add CRUD in `zou/app/blueprints/crud/`, add routes in `crud/__init__.py` |
-| Add a feature endpoint | Create blueprint package in `zou/app/blueprints/<name>/`, register in `api.py` |
-| Add request validation | Create `schemas.py` with `BaseSchema` subclass, call `validate_request_body()` in resource |
-| Add a service | Create `zou/app/services/<name>_service.py` with module-level functions |
-| Add caching | Decorate with `@cache.memoize_function(ttl)`, invalidate with `cache.cache.delete_memoized()` |
-| Emit an event | `events.emit("entity:action", {"entity_id": str(id)}, project_id=...)` |
-| Add a test | Create in `tests/` inheriting `ApiDBTestCase`, use fixture generators |
-| Install plugins | `zou install-plugin --path /path/to/plugin` |
-| Create admin user | `zou create-admin --email admin@example.com --password secret` |
+## 13. Safe-editing rules (hard rules)
+1. **Never hand-edit `site-packages/zou`** — it is wiped on every `pip install`. All backend changes go through plugins or a versioned fork build.
+2. **Plugins are git repos** — never edit the live copy under `/flow-srv/zou/plugins` directly; change the dev source, commit, reinstall.
+3. `pg_dump` before every migration; keep a `pip freeze` per deploy.
+4. Production must be reproducible from: a pinned `zou==` version + tagged plugin commits + `/etc/zou` config in git.
